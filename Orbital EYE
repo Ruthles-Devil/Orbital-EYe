@@ -1,0 +1,892 @@
+import sys, time, threading
+import numpy as np
+from datetime import datetime, timezone
+
+try:
+    import requests
+    HAS_REQUESTS = True
+except ImportError:
+    HAS_REQUESTS = False
+
+try:
+    from sgp4.api import Satrec, jday
+    HAS_SGP4 = True
+except ImportError:
+    HAS_SGP4 = False
+    print("WARN: pip install sgp4")
+
+try:
+    import cartopy.io.shapereader as shpreader
+    HAS_CARTOPY = True
+except ImportError:
+    HAS_CARTOPY = False
+
+try:
+    from vispy import app, scene
+    from vispy.scene import SceneCanvas
+except ImportError:
+    print("ERROR: pip install vispy PyOpenGL PyOpenGL_accelerate pyqt5")
+    sys.exit(1)
+
+C = {
+    'ocean'      : '#05111f',
+    'land'       : '#1a3a28',
+    'land_border': '#2ecc71',
+    'grid'       : '#0d2030',
+    'equator'    : '#1abc9c',
+    'text_main'  : '#e0fff8',
+    'text_dim'   : '#4a8a70',
+    'cyan'       : '#00e5cc',
+}
+
+# ════════════════════════════════════════════════════════════════
+#  SATELLITES
+# ════════════════════════════════════════════════════════════════
+CATALOGUE = [
+    dict(name='ISS',           norad=25544, color='#ff4d4d',
+         agency='NASA/ESA/JAXA/Roscosmos/CSA', launch='20-11-1998',
+         mass='420,000 kg',    altitude='~408 km',    incl='51.6°',
+         period='~92.7 min',   speed='7.66 km/s',
+         note='Crewed laboratory — 6 astronauts aboard',
+         extras='~1.5 million lines of flight software'),
+
+    dict(name='Hubble',        norad=20580, color='#4da6ff',
+         agency='NASA',        launch='24-04-1990',
+         mass='11,110 kg',     altitude='~537 km',    incl='28.5°',
+         period='~95.5 min',   speed='7.59 km/s',
+         note='Iconic optical / UV space telescope',
+         extras='Over 1.5 million observations to date'),
+
+    dict(name='NOAA-20',       norad=43013, color='#2ecc71',
+         agency='NOAA/NASA',   launch='18-11-2017',
+         mass='2,531 kg',      altitude='~824 km',    incl='98.7°',
+         period='~101.4 min',  speed='7.46 km/s',
+         note='Polar weather & environmental monitor',
+         extras='L2/L3: cloud masks, aerosol optical thickness, SST'),
+
+    dict(name='Starlink-1007', norad=44713, color='#f39c12',
+         agency='SpaceX',      launch='11-11-2019',
+         mass='260 kg',        altitude='~550 km',    incl='53.0°',
+         period='~95.6 min',   speed='7.60 km/s',
+         note='Broadband internet constellation (Gen 1)',
+         extras=''),
+
+    dict(name='Tiangong',      norad=48274, color='#e74c3c',
+         agency='CNSA',        launch='29-04-2021',
+         mass='~80,000 kg',    altitude='~390 km',    incl='41.5°',
+         period='~92.3 min',   speed='7.68 km/s',
+         note="China's operational space station",
+         extras='Permanent crew of 3 taikonauts'),
+
+    dict(name='Sentinel-2A',   norad=40697, color='#9b59b6',
+         agency='ESA',         launch='23-06-2015',
+         mass='1,130 kg',      altitude='~786 km',    incl='98.6°',
+         period='~100.6 min',  speed='7.48 km/s',
+         note='Earth observation — multispectral imaging',
+         extras='10 m resolution optical land monitoring'),
+
+    dict(name='GOES-18',       norad=51850, color='#e67e22',
+         agency='NOAA/NASA',   launch='01-03-2022',
+         mass='5,192 kg',      altitude='~35,786 km', incl='0.0°',
+         period='~1436 min',   speed='3.07 km/s',
+         note='Geostationary weather — Western US/Americas',
+         extras='Continuous full-disk imagery every 10 min'),
+
+    dict(name='Terra',         norad=25994, color='#1abc9c',
+         agency='NASA',        launch='18-12-1999',
+         mass='5,190 kg',      altitude='~705 km',    incl='98.2°',
+         period='~98.9 min',   speed='7.51 km/s',
+         note='Earth observation — climate & environment',
+         extras='Carries 5 instruments including MODIS'),
+
+    dict(name='Aqua',          norad=27424, color='#3498db',
+         agency='NASA',        launch='04-05-2002',
+         mass='2,934 kg',      altitude='~705 km',    incl='98.2°',
+         period='~98.8 min',   speed='7.51 km/s',
+         note='Water cycle & climate satellite',
+         extras='Part of A-Train; monitors precipitation & sea ice'),
+
+    dict(name='Landsat-9',     norad=49260, color='#27ae60',
+         agency='NASA/USGS',   launch='27-09-2021',
+         mass='2,750 kg',      altitude='~705 km',    incl='98.2°',
+         period='~99.0 min',   speed='7.50 km/s',
+         note='Land surface imaging — 30 m resolution',
+         extras="Longest continuous space land-surface record"),
+
+    dict(name='NOAA-21',       norad=54234, color='#16a085',
+         agency='NOAA/NASA',   launch='10-11-2022',
+         mass='2,531 kg',      altitude='~824 km',    incl='98.7°',
+         period='~101.4 min',  speed='7.46 km/s',
+         note='Next-gen polar weather monitor (JPSS-2)',
+         extras='Improved sensor suite over NOAA-20'),
+]
+
+FALLBACK_TLES = {
+    25544: ("1 25544U 98067A   25050.54791667  .00021938  00000+0  38908-3 0  9993",
+            "2 25544  51.6397 114.0125 0004047 128.5634 231.5772 15.50501477492516"),
+    20580: ("1 20580U 90037B   25050.49826389  .00001552  00000+0  84526-4 0  9993",
+            "2 20580  28.4699 311.5783 0002459 124.5048 235.6147 15.09621584 22053"),
+    43013: ("1 43013U 17073A   25050.49965278  .00000075  00000+0  61255-4 0  9994",
+            "2 43013  98.7459  83.5756 0001247  97.0461 263.0889 14.19561412381540"),
+    44713: ("1 44713U 19074A   25050.54166667  .00002036  00000+0  14362-3 0  9997",
+            "2 44713  53.0537 200.0125 0001312  89.7234 270.4112 15.06391876289301"),
+    48274: ("1 48274U 21035A   26053.16188763  .00017025  00000-0  20832-3 0  9995",
+            "2 48274  41.4669 302.5923 0005108 168.8632 191.2320 15.59984445275184"),
+    40697: ("1 40697U 15028A   26047.85813111 -.00000076  00000-0 -12332-4 0  9999",
+            "2 40697  98.5702 124.4652 0001084  95.5027 264.6280 14.30810822556524"),
+    51850: ("1 51850U 22021A   25339.25818207  .00000108  00000-0  00000-0 0  9990",
+            "2 51850   0.0092  79.4940 0000844 211.3925  99.3729  1.00271222  4644"),
+    25994: ("1 25994U 99068A   25254.88340253  .00000334  00000-0  77600-4 0  9996",
+            "2 25994  97.9895 309.8663 0003130  53.3437   1.0142 14.60794741368979"),
+    27424: ("1 27424U 02022A   26051.24161142  .00000872  00000-0  18408-3 0  9991",
+            "2 27424  98.4144  18.2933 0001086  47.3163  65.2893 14.61930145266186"),
+    49260: ("1 49260U 21088A   25130.17524805  .00000536  00000-0  12897-3 0  9997",
+            "2 49260  98.1904 201.1967 0001123  97.8949 262.2377 14.57128831192307"),
+    54234: ("1 54234U 22150A   25352.87580464  .00000051  00000-0  45087-4 0  9991",
+            "2 54234  98.7469 289.1077 0001959  25.9445 334.1829 14.19525881160966"),
+}
+
+TLE_STORE  = dict(FALLBACK_TLES)
+TLE_LOCK   = threading.Lock()
+TLE_SOURCE = 'fallback'
+
+
+def fetch_live_tles():
+    global TLE_SOURCE
+    if not HAS_REQUESTS:
+        return
+    while True:
+        ok = 0
+        for sat in CATALOGUE:
+            try:
+                r = requests.get(
+                    f"https://celestrak.org/satcat/tle.php?CATNR={sat['norad']}",
+                    timeout=8,
+                )
+                lines = [l.strip() for l in r.text.strip().splitlines() if l.strip()]
+                if len(lines) >= 3 and lines[1].startswith('1') and lines[2].startswith('2'):
+                    with TLE_LOCK:
+                        TLE_STORE[sat['norad']] = (lines[1], lines[2])
+                    ok += 1
+            except:
+                pass
+        if ok:
+            TLE_SOURCE = 'live'
+            print(f"[TLE] {ok} satellites refreshed from Celestrak")
+        time.sleep(600)
+
+
+def get_position(norad_id):
+    with TLE_LOCK:
+        entry = TLE_STORE.get(norad_id)
+    if not entry:
+        return None
+    l1, l2 = entry
+    if HAS_SGP4:
+        try:
+            s   = Satrec.twoline2rv(l1, l2)
+            now = datetime.now(timezone.utc)
+            jd, fr = jday(now.year, now.month, now.day,
+                          now.hour, now.minute,
+                          now.second + now.microsecond / 1e6)
+            e, r, v = s.sgp4(jd, fr)
+            if e != 0:
+                return None
+            x, y, z = r
+            gst = (280.46061837 + 360.98564736629 * (jd + fr - 2451545.0)) % 360
+            lon = (np.degrees(np.arctan2(y, x)) - gst + 360) % 360
+            if lon > 180:
+                lon -= 360
+            rm  = np.sqrt(x*x + y*y + z*z)
+            lat = np.degrees(np.arcsin(np.clip(z / rm, -1, 1)))
+            alt = rm - 6371.0
+            return lat, lon, alt
+        except:
+            return None
+    else:
+        try:
+            inc = float(l2[8:16])
+            mm  = float(l2[52:63])
+            T   = 86400 / mm
+            t   = datetime.now(timezone.utc).timestamp() % T
+            nu  = 2 * np.pi * t / T
+            lat = np.degrees(np.arcsin(np.sin(np.radians(inc)) * np.sin(nu)))
+            lon = (np.degrees(nu) * 0.8 + 360) % 360
+            if lon > 180:
+                lon -= 360
+            return lat, lon, 400.0
+        except:
+            return None
+
+
+# ════════════════════════════════════════════════════════════════
+#  LAND POLYGONS (polygraphs)
+# ════════════════════════════════════════════════════════════════
+LAND_POLYGONS = {
+    'North_America': [
+        (-168,71),(-164,68),(-160,62),(-153,57),(-148,60),(-145,61),
+        (-140,60),(-136,58),(-132,56),(-128,52),(-124,49),(-120,49),
+        (-110,49),(-98,49),(-93,47),(-87,42),(-83,42),(-80,43),
+        (-73,45),(-65,50),(-60,47),(-66,45),(-70,42),(-76,38),
+        (-75,35),(-80,32),(-81,28),(-80,25),(-83,18),(-85,15),
+        (-88,13),(-83,8),(-77,8),(-77,10),(-73,11),(-63,11),
+        (-63,18),(-70,20),(-77,25),(-80,30),(-75,35),(-70,42),
+        (-60,47),(-53,47),(-60,46),(-66,44),(-70,43),(-73,40),
+        (-75,35),(-80,32),(-77,25),(-83,18),(-88,13),(-83,8),
+        (-77,8),(-63,11),(-63,18),(-75,20),(-80,25),(-85,15),
+        (-90,10),(-92,18),(-95,20),(-97,26),(-97,30),(-94,30),
+        (-90,30),(-90,25),(-85,22),(-83,18),(-88,13),(-90,10),
+        (-95,20),(-100,28),(-104,20),(-109,24),(-114,28),(-118,34),
+        (-120,35),(-122,38),(-124,40),(-124,49),(-120,49),(-110,49),
+        (-98,49),(-93,47),(-87,42),(-83,42),(-80,43),(-76,44),
+        (-73,45),(-65,50),(-60,47),(-57,47),(-60,50),(-64,47),
+        (-66,45),(-70,43),(-75,45),(-80,43),(-83,42),(-87,42),
+        (-93,47),(-98,49),(-110,49),(-120,49),(-125,49),(-128,52),
+        (-132,56),(-136,58),(-140,60),(-145,61),(-148,60),(-153,57),
+        (-158,57),(-162,60),(-165,62),(-168,65),(-168,71),
+    ],
+    'South_America': [
+        (-80,10),(-77,8),(-75,10),(-72,12),(-70,12),(-67,11),
+        (-63,11),(-60,7),(-55,6),(-52,4),(-50,2),(-50,-5),
+        (-35,-5),(-35,-8),(-37,-12),(-40,-20),(-43,-23),(-44,-23),
+        (-48,-28),(-48,-30),(-52,-33),(-53,-35),(-53,-38),
+        (-55,-40),(-58,-42),(-60,-43),(-63,-46),(-65,-48),
+        (-66,-51),(-68,-54),(-68,-56),(-65,-55),(-63,-50),
+        (-58,-52),(-55,-53),(-53,-50),(-50,-48),(-48,-45),
+        (-45,-40),(-42,-35),(-40,-30),(-38,-25),(-36,-20),
+        (-35,-12),(-37,-5),(-40,3),(-45,3),(-50,2),(-52,4),
+        (-55,6),(-60,7),(-63,11),(-67,11),(-70,12),(-72,12),
+        (-75,10),(-77,8),(-80,10),
+    ],
+    'Europe': [
+        (-10,36),(-8,38),(-9,40),(-8,44),(-4,48),(-5,48),
+        (-2,49),(0,51),(2,51),(3,52),(5,53),(8,55),(10,57),
+        (10,58),(12,56),(14,58),(16,59),(18,60),(20,60),
+        (25,65),(27,67),(28,70),(30,70),(29,68),(26,65),
+        (24,65),(22,65),(20,64),(18,60),(16,59),(14,58),
+        (12,58),(10,58),(8,58),(5,58),(3,57),(3,52),(0,51),
+        (-3,52),(-5,48),(-8,44),(-9,40),(-8,38),(-6,37),
+        (-4,38),(-2,38),(0,38),(3,42),(7,44),(8,44),(10,44),
+        (12,44),(14,45),(16,46),(18,44),(20,44),(22,42),
+        (24,40),(26,40),(28,41),(30,42),(32,43),(34,38),
+        (28,38),(26,38),(24,38),(22,40),(20,39),(18,40),
+        (16,42),(14,44),(12,44),(10,44),(8,44),(7,44),(3,42),
+        (0,38),(-2,38),(-4,38),(-6,37),(-8,38),(-10,36),
+    ],
+    'Africa': [
+        (-17,15),(-15,10),(-13,8),(-10,5),(-7,5),(-5,5),
+        (-3,5),(0,5),(3,5),(5,5),(8,5),(10,4),(12,4),
+        (15,4),(18,5),(22,4),(25,4),(28,2),(30,0),(32,-2),
+        (35,0),(38,4),(40,8),(42,10),(43,12),(44,12),
+        (43,15),(43,18),(42,20),(40,22),(38,22),(36,22),
+        (35,24),(35,27),(34,30),(32,32),(30,32),(28,30),
+        (26,28),(24,26),(22,28),(20,30),(18,30),(16,28),
+        (14,24),(12,22),(10,20),(8,16),(5,14),(2,14),
+        (0,14),(-2,14),(-5,14),(-8,12),(-10,12),(-13,10),
+        (-15,12),(-17,14),(-17,15),
+    ],
+    'Asia_main': [
+        (26,42),(28,42),(30,42),(32,43),(34,38),(36,37),
+        (38,38),(40,38),(42,40),(44,40),(46,42),(48,42),
+        (50,40),(52,40),(55,42),(58,42),(60,44),(62,44),
+        (64,40),(66,38),(68,38),(70,36),(72,34),(74,34),
+        (76,34),(78,32),(80,30),(82,28),(84,28),(86,28),
+        (88,26),(90,26),(92,24),(94,22),(96,20),(98,18),
+        (100,15),(102,12),(104,10),(105,12),(106,10),(108,14),
+        (110,18),(112,20),(114,22),(116,22),(118,24),(120,24),
+        (122,28),(122,30),(124,32),(122,32),(120,34),(118,36),
+        (118,38),(120,40),(122,40),(124,40),(126,38),(128,36),
+        (130,36),(130,38),(132,40),(132,42),(134,44),(136,46),
+        (138,46),(140,44),(142,46),(142,48),(140,54),(138,52),
+        (136,54),(134,58),(132,60),(134,62),(136,60),(138,60),
+        (140,60),(140,62),(138,64),(138,66),(140,68),(140,70),
+        (138,70),(135,70),(132,68),(130,68),(128,66),(126,66),
+        (124,64),(120,62),(118,60),(116,56),(112,54),(110,52),
+        (108,50),(106,50),(104,52),(100,52),(96,52),(92,52),
+        (88,50),(86,50),(84,50),(80,50),(76,50),(72,52),
+        (68,52),(65,52),(62,48),(60,44),(58,42),(55,42),
+        (50,40),(48,42),(46,42),(44,40),(42,40),(40,38),
+        (38,38),(36,37),(34,38),(32,43),(30,42),(28,42),(26,42),
+    ],
+    'Japan_Korea': [
+        (130,34),(132,34),(134,34),(136,36),(138,36),(140,38),
+        (142,38),(142,40),(140,42),(138,42),(136,40),(134,38),
+        (132,36),(130,34),
+        (124,34),(126,34),(128,36),(130,36),(130,38),(128,38),(126,36),(124,34),
+    ],
+    'Australia': [
+        (114,-22),(116,-20),(118,-18),(120,-16),(122,-16),(124,-16),
+        (126,-14),(128,-14),(130,-12),(132,-12),(134,-12),(136,-12),
+        (138,-14),(140,-16),(142,-18),(144,-18),(146,-20),(148,-22),
+        (150,-24),(152,-26),(152,-28),(150,-30),(150,-32),(148,-36),
+        (146,-38),(144,-38),(142,-38),(140,-36),(138,-36),(136,-36),
+        (134,-34),(132,-34),(130,-32),(128,-34),(126,-34),(124,-32),
+        (122,-28),(120,-26),(118,-24),(116,-22),(114,-22),
+    ],
+    'New_Zealand': [
+        (172,-34),(174,-36),(176,-38),(178,-38),(178,-40),
+        (176,-42),(174,-44),(172,-44),(170,-44),(168,-46),
+        (168,-44),(170,-42),(170,-40),(172,-38),(174,-36),(172,-34),
+    ],
+    'Greenland': [
+        (-44,60),(-42,62),(-38,65),(-28,70),(-22,72),(-18,76),
+        (-20,80),(-22,83),(-30,84),(-40,84),(-50,82),(-55,80),
+        (-58,78),(-62,77),(-60,74),(-60,70),(-56,66),(-52,64),
+        (-48,62),(-44,60),
+    ],
+    'Iceland': [
+        (-24,64),(-22,64),(-18,64),(-14,64),(-14,66),(-16,66),
+        (-20,66),(-24,66),(-24,64),
+    ],
+    'Antarctica': [
+        (-180,-68),(-150,-72),(-120,-68),(-90,-72),(-60,-68),
+        (-30,-72),(0,-68),(30,-72),(60,-68),(90,-72),(120,-68),
+        (150,-72),(180,-68),(180,-90),(-180,-90),(-180,-68),
+    ],
+}
+
+
+def build_coast_segments_fallback():
+    segs = []
+    for name, pts in LAND_POLYGONS.items():
+        arr = np.array(pts, dtype=np.float32)
+        arr = np.vstack([arr, arr[0:1]])
+        segs.append(arr)
+    return segs
+
+
+def build_coast_segments_cartopy():
+    try:
+        fn = shpreader.natural_earth(resolution='50m', category='physical', name='coastline')
+        reader = shpreader.Reader(fn)
+        segs = []
+        for geom in reader.geometries():
+            if geom.geom_type == 'LineString':
+                segs.append(np.array(geom.coords, dtype=np.float32))
+            elif geom.geom_type == 'MultiLineString':
+                for part in geom.geoms:
+                    segs.append(np.array(part.coords, dtype=np.float32))
+        print(f"[MAP] Cartopy: {len(segs)} coastline segments loaded")
+        return segs
+    except Exception as e:
+        print(f"[MAP] Cartopy failed: {e}, using fallback")
+        return None
+
+PANEL_MARGIN  = 14        # gap from canvas left & bottom edge
+PANEL_W       = 450       # panel total width (px)
+PANEL_H       = 350       # panel total height (px)
+
+HDR_H         = 38        # header bar height (px)
+SECTION_H     = 18        # height of section label bars (px)
+ROW_H         = 19        # row height for data rows (px)
+FSUB          = 8.0       # font size — sub-labels (dim)
+FVAL          = 9.0       # font size — values
+FHDR          = 9.5       # font size — header
+FSEC          = 7.5       # font size — section titles
+
+# x positions within the panel (px from canvas left)
+PX            = PANEL_MARGIN              # panel left edge
+CX            = PX + PANEL_W // 2        # panel horizontal centre
+
+# Two column layout: left half and right half
+COL1_LABEL    = PX + 96                  # right edge of left label col
+COL1_VALUE    = PX + 102                 # left edge of left value col
+COL2_LABEL    = PX + 268                 # right edge of right label col
+COL2_VALUE    = PX + 274                 # left edge of right value col
+
+# Dim colours
+DIM           = '#2e6655'
+DIMMER        = '#1a3d30'
+DIVIDER_COL   = '#0e3326'
+
+
+class SatTrack:
+    TRAIL_LEN = 120
+
+    def __init__(self):
+        self.positions = {}
+        self.trails    = {s['norad']: [] for s in CATALOGUE}
+
+        # ── Canvas ───────────────────────────────────────────────
+        self.canvas = SceneCanvas(
+            title='Orbital EYE — Eye you can trust',
+            size=(1600, 900), bgcolor=C['ocean'],
+            show=False, keys='interactive',
+        )
+
+        # ── Full-window map view ─────────────────────────────────
+        self.vmap = self.canvas.central_widget.add_view()
+        self.vmap.camera = scene.PanZoomCamera(aspect=1)
+        self.vmap.camera.set_range(x=(-185, 185), y=(-95, 95))
+        self._build_map()
+
+        # ── Satellite trails ─────────────────────────────────────
+        self.trail_vis = {}
+        for sat in CATALOGUE:
+            tv = scene.visuals.Line(
+                pos=np.zeros((2, 2), dtype=np.float32),
+                color=(1, 1, 1, 0.5), width=2.0, connect='strip',
+                parent=self.vmap.scene,
+            )
+            self.trail_vis[sat['norad']] = tv
+
+        # ── Satellite markers ────────────────────────────────────
+        n = len(CATALOGUE)
+        self.mk_pos   = np.zeros((n, 2), dtype=np.float32)
+        self.mk_color = np.array(
+            [self._parse_color(s['color']) for s in CATALOGUE], dtype=np.float32
+        )
+        self.mk_size  = np.full(n, 16.0, dtype=np.float32)
+        self.markers  = scene.visuals.Markers(parent=self.vmap.scene)
+        self._flush_markers()
+
+        # ── Name labels ──────────────────────────────────────────
+        self.name_labels = {}
+        for sat in CATALOGUE:
+            lbl = scene.visuals.Text(
+                text=sat['name'], color=sat['color'],
+                font_size=10, bold=True,
+                pos=(0, 0), parent=self.vmap.scene,
+            )
+            lbl.visible = False
+            self.name_labels[sat['norad']] = lbl
+
+        # ── HUD overlay — pixel-space camera ────────────────────
+        self.selected = None
+        W, H = self.canvas.size
+
+        self.vhud = self.canvas.central_widget.add_view()
+        self.vhud.camera = scene.PanZoomCamera(aspect=None)
+        # flip=True so y=0 is screen-top, y=H is screen-bottom
+        self.vhud.camera.flip = (False, True)
+        self.vhud.camera.set_range(x=(0, W), y=(0, H))
+
+        self._hud_widgets = []
+        self._hud_dynamic = {}
+        self._build_panel(W, H)
+
+        self.canvas.events.mouse_press.connect(self._on_mouse)
+        self.canvas.events.key_press.connect(self._on_key)
+        self.canvas.events.resize.connect(self._on_resize)
+
+        self.timer = app.Timer(interval=2.0, connect=self._tick, start=False)
+        self.canvas.show()
+        self.timer.start()
+
+    def _build_panel(self, W, H):
+        p = self.vhud.scene
+
+        # ── Destroy previous widgets ──────────────────────────────
+        for w in self._hud_widgets:
+            try:
+                w.parent = None
+            except Exception:
+                pass
+        self._hud_widgets.clear()
+        self._hud_dynamic.clear()
+
+        # ── Y-coordinates (screen-space: 0=top, H=bottom) ────────
+        #  panel_top_y   = screen y of the TOP edge of the panel card
+        #  panel_bot_y   = screen y of the BOTTOM edge
+        panel_bot_y  = H - PANEL_MARGIN
+        panel_top_y  = panel_bot_y - PANEL_H
+        panel_cx     = PX + PANEL_W / 2.0
+
+        # ── Helper — register a widget ────────────────────────────
+        def reg(w):
+            self._hud_widgets.append(w)
+            return w
+
+        def mk_rect(cx, cy, w, h, color, border_color='#00000000', bw=0):
+            r = scene.visuals.Rectangle(
+                center=(cx, cy), width=w, height=h,
+                color=color, border_color=border_color, border_width=bw,
+                parent=p,
+            )
+            r.visible = False
+            return reg(r)
+
+        def mk_text(text, x, y, color, size, bold=False,
+                    ax='left', ay='center'):
+            t = scene.visuals.Text(
+                text=text, color=color, font_size=size, bold=bold,
+                pos=(x, y), anchor_x=ax, anchor_y=ay,
+                parent=p,
+            )
+            t.visible = False
+            return reg(t)
+
+        self._bg = mk_rect(
+            panel_cx, (panel_top_y + panel_bot_y) / 2,
+            PANEL_W, PANEL_H,
+            color='#04090f',
+            border_color='#1abc9c55', bw=1.5,
+        )
+
+        # Left accent stripe (3 px, full height, coloured per satellite)
+        self._accent = mk_rect(
+            PX + 2, (panel_top_y + panel_bot_y) / 2,
+            3, PANEL_H,
+            color='#1abc9c',
+        )
+
+        hdr_cy  = panel_top_y + HDR_H / 2
+        hdr_bot = panel_top_y + HDR_H
+
+        self._hdr_bg = mk_rect(
+            panel_cx, hdr_cy,
+            PANEL_W, HDR_H,
+            color='#071810',
+            border_color='#1abc9c22', bw=1,
+        )
+
+        # Satellite colour dot in header (small square, updated dynamically)
+        self._hdr_dot = mk_rect(
+            PX + 16, hdr_cy, 8, 8,
+            color='#1abc9c',
+        )
+
+        # Header satellite name (dynamic)
+        self._hdr_name = mk_text(
+            '', PX + 26, hdr_cy,
+            '#e8fff8', FHDR, bold=True, ax='left', ay='center',
+        )
+        self._hud_dynamic['hdr_name'] = self._hdr_name
+
+        # Header sub-label on right side
+        self._hdr_sub = mk_text(
+            'LIVE TELEMETRY', PX + PANEL_W - 12, hdr_cy,
+            DIM, 7.0, bold=False, ax='right', ay='center',
+        )
+
+        y = hdr_bot + 4    # start just below header, leave 4 px gap
+
+        def section_bar(label, yy):
+            """Thin section heading row."""
+            bar_cy = yy + SECTION_H / 2
+            reg(scene.visuals.Line(
+                pos=np.array([[PX + 8, yy], [PX + PANEL_W - 8, yy]], dtype=np.float32),
+                color=DIVIDER_COL, width=1, parent=p,
+            )).visible = False
+            t = mk_text(label.upper(), PX + 12, bar_cy + 1,
+                        DIMMER, FSEC, bold=True, ax='left', ay='center')
+            return yy + SECTION_H
+
+        def data_row(label, dyn_key, yy,
+                     label2=None, dyn_key2=None,
+                     col1=(COL1_LABEL, COL1_VALUE),
+                     col2=(COL2_LABEL, COL2_VALUE)):
+
+            row_cy = yy + ROW_H / 2
+            # Left pair
+            mk_text(label, col1[0], row_cy, DIM, FSUB,
+                    ax='right', ay='center')
+            vt = mk_text('—', col1[1], row_cy, '#4a8a70', FVAL,
+                         ax='left', ay='center')
+            self._hud_dynamic[dyn_key] = vt
+
+            if label2 and dyn_key2:
+                mk_text(label2, col2[0], row_cy, DIM, FSUB,
+                        ax='right', ay='center')
+                vt2 = mk_text('—', col2[1], row_cy, '#4a8a70', FVAL,
+                              ax='left', ay='center')
+                self._hud_dynamic[dyn_key2] = vt2
+            return yy + ROW_H
+
+        # ── Section: SPACECRAFT HUD
+        y = section_bar('Spacecraft', y)
+        y = data_row('Agency',  'agency', y)
+        y = data_row('Launch',  'launch', y, 'Mass',   'mass')
+        y = data_row('Orbit',   'orbit',  y, 'Incl.',  'incl')
+        y = data_row('Period',  'period', y, 'Speed',  'speed')
+        y += 2
+        self._div1 = reg(scene.visuals.Line(
+            pos=np.array([[PX + 8, y], [PX + PANEL_W - 8, y]], dtype=np.float32),
+            color='#0d2820', width=1, parent=p,
+        ))
+        self._div1.visible = False
+        y += 2
+
+        # ── Section: LIVE POSITION ────────────────────────────────
+        y = section_bar('Live Position', y)
+        y = data_row('Lat',  'lat', y,
+                     'Long', 'lon')
+        y = data_row('Altitude',  'alt', y,
+                     'NORAD ID',  'norad')
+
+        y += 2
+        self._div2 = reg(scene.visuals.Line(
+            pos=np.array([[PX + 8, y], [PX + PANEL_W - 8, y]], dtype=np.float32),
+            color='#0d2820', width=1, parent=p,
+        ))
+        self._div2.visible = False
+        y += 4
+
+        # ── Note / extras row ─────────────────────────────────────
+        self._note = mk_text('', PX + 12, y + ROW_H / 2,
+                             '#2e6655', 7.5, ax='left', ay='center')
+        self._hud_dynamic['note'] = self._note
+
+        y += ROW_H + 2
+
+        self._extras = mk_text('', PX + 12, y + ROW_H / 2,
+                               '#1e4a38', 7.0, ax='left', ay='center')
+        self._hud_dynamic['extras'] = self._extras
+
+        # ── Esc hint (bottom-right of card) ───────────────────────
+        hint_y = panel_bot_y - 8
+        self._hint = mk_text('[Esc] close', PX + PANEL_W - 10, hint_y,
+                             '#1a3d30', 6.5, ax='right', ay='bottom')
+
+        # Store panel geometry for _show_panel
+        self._panel_visible = False
+
+    def _show_panel(self, visible):
+        self._panel_visible = visible
+        for w in self._hud_widgets:
+            w.visible = visible
+
+    def _update_panel(self):
+        if self.selected is None:
+            return
+        sat = CATALOGUE[self.selected]
+        nid = sat['norad']
+        pos = self.positions.get(nid)
+        sc  = sat['color']
+
+        # Accent stripe + dot use the satellite colour
+        col_rgba = self._parse_color(sc)
+        self._accent.color      = col_rgba
+        self._hdr_dot.color     = col_rgba
+        self._hdr_bg.border_color = sc + '33'
+
+        # Header name
+        d = self._hud_dynamic
+        d['hdr_name'].text  = sat['name'].upper()
+        d['hdr_name'].color = sc
+
+        # Spacecraft fields
+        d['agency'].text  = sat['agency']
+        d['launch'].text  = sat['launch']
+        d['mass'].text    = sat['mass']
+        d['orbit'].text   = sat['altitude']
+        d['incl'].text    = sat['incl']
+        d['period'].text  = sat['period']
+        d['speed'].text   = sat['speed']
+        d['norad'].text   = f"#{nid}"
+
+        # Set value text colours to satellite colour (dimmed)
+        for key in ('agency','launch','mass','orbit','incl','period','speed','norad'):
+            d[key].color = sc
+
+        # Live position
+        if pos:
+            lat, lon, alt = pos
+            d['lat'].text = f"{abs(lat):.4f}°  {'N' if lat >= 0 else 'S'}"
+            d['lon'].text = f"{abs(lon):.4f}°  {'E' if lon >= 0 else 'W'}"
+            d['alt'].text = f"{alt:,.1f} km"
+            for key in ('lat', 'lon', 'alt'):
+                d[key].color = '#e0fff8'   # brighter white for live data
+        else:
+            for key in ('lat', 'lon', 'alt'):
+                d[key].text  = 'fetching…'
+                d[key].color = DIM
+
+        # Note + extras
+        d['note'].text   = sat.get('note', '')
+        d['extras'].text = sat.get('extras', '')
+
+        self._show_panel(True)
+
+    # ═══════════════════════════════════════════════════════════
+    def _on_resize(self, event):
+        W, H = event.size
+        self.vhud.camera.set_range(x=(0, W), y=(0, H))
+        self._build_panel(W, H)
+        if self.selected is not None:
+            self._update_panel()
+
+    def _on_mouse(self, event):
+        if event.button != 1:
+            return
+        tr  = self.vmap.scene.transform
+        pos = tr.imap(event.pos)
+        cx, cy = float(pos[0]), float(pos[1])
+
+        best, bd = None, 5.0
+        for i, sat in enumerate(CATALOGUE):
+            p = self.positions.get(sat['norad'])
+            if p is None:
+                continue
+            lat, lon, _ = p
+            d = np.hypot(lon - cx, lat - cy)
+            if d < bd:
+                bd = d; best = i
+
+        if best is not None:
+            self.selected = best
+            for i in range(len(CATALOGUE)):
+                self.mk_size[i]  = 28.0 if i == best else 16.0
+                self.mk_color[i] = (1, 1, 1, 1) if i == best \
+                                   else self._parse_color(CATALOGUE[i]['color'])
+            self._flush_markers()
+            self._update_panel()
+        else:
+            self._deselect()
+
+    def _deselect(self):
+        self.selected = None
+        for i, sat in enumerate(CATALOGUE):
+            self.mk_size[i]  = 16.0
+            self.mk_color[i] = self._parse_color(sat['color'])
+        self._flush_markers()
+        self._show_panel(False)
+
+    def _build_map(self):
+        p = self.vmap.scene
+        scene.visuals.Rectangle(
+            center=(0, 0), width=370, height=185,
+            color='#05111f', border_color='#05111f', parent=p,
+        )
+        for name, pts in LAND_POLYGONS.items():
+            arr = np.array(pts, dtype=np.float32)
+            arr2 = np.vstack([arr, arr[0:1]])
+            scene.visuals.Line(pos=arr2, color='#142e1e',
+                               width=1, connect='strip', parent=p)
+        for lon in range(-180, 181, 30):
+            scene.visuals.Line(
+                pos=np.array([[lon, -90], [lon, 90]], dtype=np.float32),
+                color='#0a1f2e', width=0.7, parent=p)
+        for lat in range(-90, 91, 30):
+            scene.visuals.Line(
+                pos=np.array([[-180, lat], [180, lat]], dtype=np.float32),
+                color='#0a1f2e', width=0.7, parent=p)
+        for lon in range(-150, 181, 30):
+            lbl = 'E' if lon > 0 else ('W' if lon < 0 else '')
+            scene.visuals.Text(text=f"{abs(lon)}{lbl}", color='#1a4a38',
+                               font_size=7, pos=(lon, -87), parent=p)
+        for lat in range(-60, 91, 30):
+            lbl = 'N' if lat > 0 else ('S' if lat < 0 else '')
+            if lat == 0: lbl = ''
+            scene.visuals.Text(text=f"{abs(lat)}{lbl}", color='#1a4a38',
+                               font_size=7, pos=(-178, lat), parent=p)
+        segs = (build_coast_segments_cartopy() if HAS_CARTOPY else None) \
+               or build_coast_segments_fallback()
+        for seg in segs:
+            if len(seg) < 2: continue
+            scene.visuals.Line(
+                pos=np.array(seg, dtype=np.float32)[:, :2],
+                color='#2ecc71', width=1.5, connect='strip', parent=p)
+        scene.visuals.Line(
+            pos=np.array([[-180, 0], [180, 0]], dtype=np.float32),
+            color='#1abc9c66', width=1.5, parent=p)
+        scene.visuals.Line(
+            pos=np.array([[0, -90], [0, 90]], dtype=np.float32),
+            color='#1abc9c44', width=1.0, parent=p)
+        border = np.array(
+            [[-180,-90],[180,-90],[180,90],[-180,90],[-180,-90]], dtype=np.float32)
+        scene.visuals.Line(pos=border, color='#1abc9c88', width=1.5, parent=p)
+
+    def _flush_markers(self):
+        self.markers.set_data(
+            pos=self.mk_pos,
+            face_color=self.mk_color,
+            edge_color=np.ones_like(self.mk_color),
+            edge_width=2.0,
+            size=self.mk_size,
+        )
+
+    @staticmethod
+    def _parse_color(hex_str):
+        h = hex_str.lstrip('#')
+        return tuple(int(h[i:i+2], 16) / 255.0 for i in (0, 2, 4)) + (1.0,)
+
+    def _on_key(self, event):
+        if event.key == 'Escape':
+            self._deselect()
+
+    def _tick(self, event):
+        now    = datetime.now(timezone.utc)
+        active = 0
+
+        for i, sat in enumerate(CATALOGUE):
+            nid = sat['norad']
+            pos = get_position(nid)
+
+            if pos is None:
+                self.mk_pos[i] = [0, -200]
+                self.name_labels[nid].visible = False
+                continue
+
+            lat, lon, alt = pos
+            self.positions[nid] = pos
+            active += 1
+
+            self.mk_pos[i] = [lon, lat]
+            if self.selected != i:
+                self.mk_color[i] = self._parse_color(sat['color'])
+
+            lbl = self.name_labels[nid]
+            lbl.pos     = (lon + 3, lat + 3)
+            lbl.visible = True
+
+            hist = self.trails[nid]
+            hist.append([lon, lat])
+            if len(hist) > self.TRAIL_LEN:
+                hist.pop(0)
+
+            if len(hist) >= 2:
+                pts, prev = [], None
+                for pt in hist:
+                    if prev is not None and abs(pt[0] - prev) > 150:
+                        pts.append([np.nan, np.nan])
+                    pts.append(pt)
+                    prev = pt[0]
+                arr = np.array(pts, dtype=np.float32)
+                n   = len(arr)
+                r, g, b, _ = self._parse_color(sat['color'])
+                alphas = np.linspace(0.06, 0.80, n)
+                colors = np.column_stack([
+                    np.full(n, r), np.full(n, g),
+                    np.full(n, b), alphas,
+                ]).astype(np.float32)
+                self.trail_vis[nid].set_data(pos=arr, color=colors)
+
+        self._flush_markers()
+        if self.selected is not None:
+            self._update_panel()
+
+        sgp = 'SGP4' if HAS_SGP4 else 'simplified'
+        print(f"\r[{now.strftime('%H:%M:%S')} utc]  "
+              f"{active}/{len(CATALOGUE)} active  |  "
+              f"TLE: {TLE_SOURCE}  |  propagator: {sgp}   ",
+              end='', flush=True)
+
+    def run(self):
+        app.run()
+
+
+if __name__ == '__main__':
+    print("=" * 65)
+    print("  Orbital EYE — REAL-TIME ORBITAL TRACKER")
+    print("  by Gagandeep Singh Rathore")
+    print("=" * 65)
+    print()
+    print("  Required:  pip install vispy PyOpenGL PyOpenGL_accelerate pyqt5 sgp4 requests numpy")
+    print("  Optional:  pip install cartopy   (sharper 50m coastlines)")
+    print()
+    for s in CATALOGUE:
+        print(f"    {s['name']:16s}  NORAD #{s['norad']}  {s['color']}")
+    print()
+    print("  Controls:")
+    print("    Scroll   Zoom in/out")
+    print("    Drag     Pan the map")
+    print("    Click    Select satellite — show telemetry panel")
+    print("    Esc      Deselect / close panel")
+    print("=" * 65)
+    print()
+
+    t = threading.Thread(target=fetch_live_tles, daemon=True)
+    t.start()
+
+    SatTrack().run()
