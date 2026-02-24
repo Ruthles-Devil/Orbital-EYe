@@ -121,10 +121,9 @@ https://celestrak.org/satcat/tle.php?CATNR=<NORAD_ID>
 A status indicator in the panel shows whether data is `live` or `fallback`.
 
 ---
+🖼️ Visual Upgrades
 
-## 📝 License
-
-MIT License — free to use, modify, and distribute.
+<img width="1719" height="977" alt="Screenshot 2026-02-24 at 2 23 36 PM" src="https://github.com/user-attachments/assets/54f978ec-7b28-4dc2-a001-81230aed0e6f" />
 
 ---
 
