@@ -256,10 +256,10 @@ The most computationally intensive operation is the **initial map construction**
 
 In SGP4-unavailable environments, the fallback propagator:
 
-- ✅ Correctly preserves orbital inclination as peak latitude envelope
-- ✅ Preserves approximate orbital period
-- ❌ Accumulates systematic longitude errors over time
-- ❌ Does not model J2 precession or atmospheric drag
+-  Correctly preserves orbital inclination as peak latitude envelope
+-  Preserves approximate orbital period
+-  Accumulates systematic longitude errors over time
+-  Does not model J2 precession or atmospheric drag
 
 The terminal status line clearly indicates propagator mode (`SGP4` or `simplified`) so operators are aware of accuracy level.
 
@@ -284,12 +284,12 @@ Placing fixed-size UI elements in geographic coordinates would cause them to sca
 
 ### 7.3 Future Work
 
-- 🌍 **3D globe rendering** mode using VisPy's 3D scene graph
-- 📡 **Ground station markers** with real-time azimuth/elevation computation
-- ⏰ **Satellite pass prediction** and event alerting (AOS, LOS, maximum elevation)
-- 🛰️ **Dynamic constellation expansion** supporting full Starlink, OneWeb, or Iridium catalogues
-- 📁 **Export functionality** for KML/GeoJSON ground track overlays
-- 🔐 **Space-Track.org integration** for classified NORAD catalogue access
+-  **3D globe rendering** mode using VisPy's 3D scene graph
+-  **Ground station markers** with real-time azimuth/elevation computation
+-  **Satellite pass prediction** and event alerting (AOS, LOS, maximum elevation)
+-  **Dynamic constellation expansion** supporting full Starlink, OneWeb, or Iridium catalogues
+-  **Export functionality** for KML/GeoJSON ground track overlays
+-  **Space-Track.org integration** for classified NORAD catalogue access
 
 ---
 
